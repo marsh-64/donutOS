@@ -15,6 +15,13 @@ use crate::log_redaction::Plain;
 // the UI can surface it and the caller can move on / retry.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// A long response on some networks delivers one TCP window (~20KB) and then
+/// never another byte. Slices under that window each finish; a fresh
+/// connection is required because the stalled one does not recover.
+const SMALL_SLICE_BYTES: u64 = 16 * 1024;
+const SMALL_SLICE_WORKERS: usize = 16;
+const SMALL_SLICE_TRIGGER: u64 = 64 * 1024;
+
 // Sent on both the asset request and its checksum sidecar so the CDN sees one
 // consistent client for the pair.
 const DOWNLOAD_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
@@ -416,6 +423,174 @@ impl Downloader {
     Ok(expected)
   }
 
+  /// Finish a download whose long connection dies after one TCP window.
+  ///
+  /// Each slice is 16KB on its own connection: a reused connection stalls the
+  /// same way, and anything larger than one window never arrives. Sixteen
+  /// slices run at once. Bytes already on disk stay where they are.
+  #[allow(clippy::too_many_arguments)]
+  async fn download_in_small_slices(
+    &self,
+    browser_type: BrowserType,
+    version: &str,
+    download_url: &str,
+    file_path: &Path,
+    start: u64,
+    total: u64,
+    cancel_token: Option<CancellationToken>,
+  ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    let file = std::fs::OpenOptions::new()
+      .read(true)
+      .write(true)
+      .create(true)
+      .truncate(false)
+      .open(file_path)?;
+    if file.metadata()?.len() < total {
+      file.set_len(total)?;
+    }
+    let file = Arc::new(std::sync::Mutex::new(file));
+    let client = crate::app_proxy::client_builder()
+      .connect_timeout(std::time::Duration::from_secs(20))
+      .read_timeout(std::time::Duration::from_secs(8))
+      .timeout(std::time::Duration::from_secs(12))
+      .pool_max_idle_per_host(0)
+      .http1_only()
+      .build()?;
+
+    let next = Arc::new(AtomicU64::new(start));
+    let filled = Arc::new(AtomicU64::new(start));
+    let stop = Arc::new(AtomicBool::new(false));
+    let url = download_url.to_string();
+    let started = std::time::Instant::now();
+    let mut tasks = tokio::task::JoinSet::new();
+
+    let progress_stop = stop.clone();
+    let progress_filled = filled.clone();
+    let progress_browser = browser_type.as_str().to_string();
+    let progress_version = version.to_string();
+    tokio::spawn(async move {
+      loop {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if progress_stop.load(Ordering::Relaxed) {
+          break;
+        }
+        let have = progress_filled.load(Ordering::Relaxed);
+        let elapsed = started.elapsed().as_secs_f64().max(0.001);
+        let gained = have.saturating_sub(start) as f64;
+        let speed = gained / elapsed;
+        note_progress(&progress_browser, &progress_version);
+        let _ = events::emit(
+          "download-progress",
+          &DownloadProgress {
+            browser: progress_browser.clone(),
+            version: progress_version.clone(),
+            downloaded_bytes: have,
+            total_bytes: Some(total),
+            percentage: (have as f64 / total as f64) * 100.0,
+            speed_bytes_per_sec: speed,
+            eta_seconds: (speed > 0.0).then(|| (total.saturating_sub(have) as f64) / speed),
+            stage: "downloading".to_string(),
+            error: None,
+          },
+        );
+      }
+    });
+
+    for _ in 0..SMALL_SLICE_WORKERS {
+      let client = client.clone();
+      let url = url.clone();
+      let next = next.clone();
+      let filled = filled.clone();
+      let file = file.clone();
+      let cancel_token = cancel_token.clone();
+      tasks.spawn(async move {
+        loop {
+          if cancel_token
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+          {
+            return Err("Download cancelled".to_string());
+          }
+          let offset = next.fetch_add(SMALL_SLICE_BYTES, Ordering::Relaxed);
+          if offset >= total {
+            return Ok(());
+          }
+          let end = (offset + SMALL_SLICE_BYTES - 1).min(total - 1);
+          let mut last_err = String::from("slice failed");
+          let mut bytes = None;
+          for _attempt in 0..4 {
+            match fetch_slice(&client, &url, offset, end).await {
+              Ok(got) => {
+                bytes = Some(got);
+                break;
+              }
+              Err(err) => {
+                last_err = err;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+              }
+            }
+          }
+          let Some(bytes) = bytes else {
+            return Err(last_err);
+          };
+          {
+            let mut file = file.lock().unwrap_or_else(|err| err.into_inner());
+            file
+              .seek(SeekFrom::Start(offset))
+              .map_err(|err| err.to_string())?;
+            file.write_all(&bytes).map_err(|err| err.to_string())?;
+          }
+          filled.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        }
+      });
+    }
+
+    let mut failure: Option<String> = None;
+    while let Some(joined) = tasks.join_next().await {
+      match joined {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+          failure = Some(err);
+          tasks.abort_all();
+          break;
+        }
+        Err(err) => {
+          failure = Some(err.to_string());
+          tasks.abort_all();
+          break;
+        }
+      }
+    }
+    stop.store(true, Ordering::Relaxed);
+    if let Some(err) = failure {
+      return Err(err.into());
+    }
+    {
+      let file = file.lock().unwrap_or_else(|err| err.into_inner());
+      file.sync_all()?;
+    }
+    note_progress(browser_type.as_str(), version);
+    let _ = events::emit(
+      "download-progress",
+      &DownloadProgress {
+        browser: browser_type.as_str().to_string(),
+        version: version.to_string(),
+        downloaded_bytes: total,
+        total_bytes: Some(total),
+        percentage: 100.0,
+        speed_bytes_per_sec: 0.0,
+        eta_seconds: Some(0.0),
+        stage: "downloading".to_string(),
+        error: None,
+      },
+    );
+    Ok(file_path.to_path_buf())
+  }
+
   async fn stream_download(
     &self,
     browser_type: BrowserType,
@@ -560,8 +735,27 @@ impl Downloader {
           }
         }
       } else if existing_size > 0 && response.status().is_success() {
-        // Server ignored range or we asked from 0; if 200 and existing file has content, start fresh
-        // Truncate existing file so we don't append duplicate bytes
+        // The server ignored the range and would send the whole object again.
+        // Discarding the partial throws away everything already saved, so keep
+        // it and fetch the tail in small slices instead of appending a second copy.
+        let total = total_size.unwrap_or(0);
+        if total > existing_size {
+          log::info!(
+            "Range ignored, continuing in small slices browser={} version={version} offset={existing_size} total={total}",
+            browser_type.as_str()
+          );
+          return self
+            .download_in_small_slices(
+              browser_type,
+              version,
+              download_url,
+              &file_path,
+              existing_size,
+              total,
+              cancel_token.cloned(),
+            )
+            .await;
+        }
         let _ = std::fs::remove_file(&file_path);
         existing_size = 0;
       }
@@ -616,12 +810,20 @@ impl Downloader {
       loop {
         // Wrap each read in an idle timeout so a stalled connection (no bytes flowing)
         // surfaces as a retryable error instead of awaiting forever.
-        let next = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()).await {
+        // A transfer that has barely started and then goes quiet is the
+        // one-window stall, not a slow link. Notice it in seconds and switch
+        // to slices; a transfer that is already moving keeps the long timeout.
+        let idle = if downloaded.saturating_sub(existing_size) < SMALL_SLICE_TRIGGER {
+          std::time::Duration::from_secs(8)
+        } else {
+          STREAM_IDLE_TIMEOUT
+        };
+        let next = match tokio::time::timeout(idle, stream.next()).await {
           Ok(item) => item,
           Err(_) => {
             retryable_stream_err = Some(format!(
               "Download stalled: no data received for {}s",
-              STREAM_IDLE_TIMEOUT.as_secs()
+              idle.as_secs()
             ));
             break;
           }
@@ -692,6 +894,27 @@ impl Downloader {
       file.flush()?;
       drop(file);
 
+      if let (Some(_), Some(total)) = (&retryable_stream_err, total_size) {
+        let gained = downloaded.saturating_sub(existing_size);
+        if gained < SMALL_SLICE_TRIGGER && total > downloaded {
+          log::info!(
+            "Download stalled after a short burst, continuing in small slices browser={} version={version} offset={downloaded} total={total}",
+            browser_type.as_str()
+          );
+          return self
+            .download_in_small_slices(
+              browser_type,
+              version,
+              download_url,
+              &file_path,
+              downloaded,
+              total,
+              cancel_token.cloned(),
+            )
+            .await;
+        }
+      }
+
       let Some(err) = retryable_stream_err else {
         return Ok(file_path);
       };
@@ -726,34 +949,46 @@ impl Downloader {
     version: &str,
     smoke_even_if_unchanged: bool,
   ) -> Result<(), String> {
-    let major = version
-      .split('.')
-      .next()
-      .and_then(|value| value.parse::<u32>().ok())
-      .unwrap_or(u32::MAX);
-    if major >= 155 && version != "155.0.8059.79" {
-      return Err(format!("unsupported Wayfern session-cap layout: {version}"));
+    // The entitlement patch edits Windows chrome.dll. macOS and Linux ship an
+    // app bundle or a different binary; requiring that file deleted a good
+    // install. Those builds are registered as published.
+    #[cfg(not(target_os = "windows"))]
+    {
+      let _ = (engine_dir, smoke_even_if_unchanged);
+      log::info!("Wayfern engine installed as published version={version}");
+      Ok(())
     }
-    let dll = engine_dir.join("chrome.dll");
-    let ttl = crate::engine_patch::patch_session_ttl(&dll, version).map_err(|e| e.to_string())?;
-    if version.starts_with("155.") && ttl.is_none() {
-      return Err("the required 155 session-cap patch was not applied".to_string());
+    #[cfg(target_os = "windows")]
+    {
+      let major = version
+        .split('.')
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(u32::MAX);
+      if major >= 155 && version != "155.0.8059.79" {
+        return Err(format!("unsupported Wayfern session-cap layout: {version}"));
+      }
+      let dll = engine_dir.join("chrome.dll");
+      let ttl = crate::engine_patch::patch_session_ttl(&dll, version).map_err(|e| e.to_string())?;
+      if version.starts_with("155.") && ttl.is_none() {
+        return Err("the required 155 session-cap patch was not applied".to_string());
+      }
+      let gate = crate::engine_patch::patch_chrome_dll(&dll).map_err(|e| e.to_string())?;
+      let ttl_changed = ttl
+        .as_ref()
+        .is_some_and(|reports| reports.iter().any(|report| !report.already_patched));
+      if smoke_even_if_unchanged || !gate.already_patched || ttl_changed {
+        crate::engine_patch::verify_gate_open(engine_dir).await?;
+      }
+      log::info!(
+        "Wayfern engine ready version={} gate_already={} ttl_branches={} smoke={}",
+        version,
+        gate.already_patched,
+        ttl.as_ref().map_or(0, |reports| reports.len()),
+        smoke_even_if_unchanged || !gate.already_patched || ttl_changed
+      );
+      Ok(())
     }
-    let gate = crate::engine_patch::patch_chrome_dll(&dll).map_err(|e| e.to_string())?;
-    let ttl_changed = ttl
-      .as_ref()
-      .is_some_and(|reports| reports.iter().any(|report| !report.already_patched));
-    if smoke_even_if_unchanged || !gate.already_patched || ttl_changed {
-      crate::engine_patch::verify_gate_open(engine_dir).await?;
-    }
-    log::info!(
-      "Wayfern engine ready version={} gate_already={} ttl_branches={} smoke={}",
-      version,
-      gate.already_patched,
-      ttl.as_ref().map_or(0, |reports| reports.len()),
-      smoke_even_if_unchanged || !gate.already_patched || ttl_changed
-    );
-    Ok(())
   }
 
   pub async fn download_browser_full(
@@ -1052,7 +1287,7 @@ impl Downloader {
         let error = format!("Wayfern engine patch/smoke failed: {why}");
         let _ = events::emit(
           "download-progress",
-          &DownloadProgress::failed(&browser_str, &version, Some(error.clone())),
+          DownloadProgress::failed(&browser_str, &version, Some(error.clone())),
         );
         log::error!("{error}");
         return Err(error.into());
@@ -1232,6 +1467,38 @@ async fn verify_archive_checksum(
     .to_string()
     .into(),
   )
+}
+
+/// One 16KB piece on a connection that will not be reused.
+async fn fetch_slice(
+  client: &reqwest::Client,
+  url: &str,
+  start: u64,
+  end: u64,
+) -> Result<Vec<u8>, String> {
+  let response = client
+    .get(url)
+    .header("User-Agent", DOWNLOAD_USER_AGENT)
+    .header("Connection", "close")
+    .header("Range", format!("bytes={start}-{end}"))
+    .send()
+    .await
+    .map_err(|err| err.to_string())?;
+  if response.status().as_u16() != 206 {
+    return Err(format!(
+      "slice answered HTTP {}",
+      response.status().as_u16()
+    ));
+  }
+  let expected = (end - start + 1) as usize;
+  let bytes = response.bytes().await.map_err(|err| err.to_string())?;
+  if bytes.len() != expected {
+    return Err(format!(
+      "slice returned {} of {expected} bytes",
+      bytes.len()
+    ));
+  }
+  Ok(bytes.to_vec())
 }
 
 /// Prefix the calling context onto a bare message, but leave an already-coded

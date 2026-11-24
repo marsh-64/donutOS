@@ -42,9 +42,20 @@ fn chromium_fingerprint_seed(profile_id: &uuid::Uuid) -> u32 {
   hash.max(1)
 }
 
+/// The platform fingerprint-chromium will report. Only the three names its
+/// `--fingerprint-platform` switch accepts; android and ios stay unset so the
+/// engine keeps the host OS instead of being handed a value it ignores.
+#[cfg(feature = "free")]
+fn chromium_fingerprint_platform(os: Option<&str>) -> Option<&'static str> {
+  match os.and_then(WayfernManager::normalize_os_name) {
+    Some(platform @ ("windows" | "linux" | "macos")) => Some(platform),
+    _ => None,
+  }
+}
+
 #[cfg(all(test, feature = "free"))]
 mod fingerprint_seed_tests {
-  use super::chromium_fingerprint_seed;
+  use super::{chromium_fingerprint_platform, chromium_fingerprint_seed};
 
   #[test]
   fn the_seed_is_stable_distinct_and_nonzero() {
@@ -54,6 +65,14 @@ mod fingerprint_seed_tests {
     assert_eq!(seed, chromium_fingerprint_seed(&a));
     assert_ne!(seed, 0);
     assert_ne!(seed, chromium_fingerprint_seed(&b));
+  }
+
+  #[test]
+  fn the_chosen_os_becomes_the_fingerprint_platform() {
+    assert_eq!(chromium_fingerprint_platform(Some("Linux")), Some("linux"));
+    assert_eq!(chromium_fingerprint_platform(Some("macos")), Some("macos"));
+    assert_eq!(chromium_fingerprint_platform(Some("android")), None);
+    assert_eq!(chromium_fingerprint_platform(None), None);
   }
 }
 
@@ -1084,14 +1103,12 @@ impl BrowserRunner {
       }
       crate::wayfern_manager::LaunchKind::Interactive => None,
     };
+    // A manual window has no CDP channel, so the URL it was given — or the
+    // profile's start pages — rides the command line. An automation run
+    // keeps only an explicit URL; its pages open over the debugging port.
+    let pages = crate::wayfern_manager::launch_pages(url, &profile.start_urls, kind);
     let mut args = engine
-      .create_launch_args(
-        profile_path_str,
-        None,
-        url.map(|s| s.to_string()),
-        port,
-        headless,
-      )
+      .create_launch_args(profile_path_str, None, None, port, headless)
       .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
         format!("Failed to build Chromium arguments: {e}").into()
       })?;
@@ -1108,12 +1125,30 @@ impl BrowserRunner {
       // (browser_version_manager): a per-profile seed drives deterministic
       // fingerprint injection at the C++ level — canvas noise, WebGL GPU
       // strings, hardware concurrency, brands. Same profile id → same
-      // machine, across restarts and fresh profile copies.
+      // machine, across restarts and fresh profile copies. The OS the
+      // profile claims (linux, windows, macos) is the platform the engine
+      // reports; without one it keeps the host OS.
       let seed = chromium_fingerprint_seed(&profile.id);
       args.push(format!("--fingerprint={seed}"));
-      if cfg!(target_os = "windows") {
-        args.push("--fingerprint-platform=windows".to_string());
+      let claimed_os = profile
+        .wayfern_config
+        .as_ref()
+        .and_then(|config| config.os.as_deref());
+      match chromium_fingerprint_platform(claimed_os) {
+        Some(platform) => args.push(format!("--fingerprint-platform={platform}")),
+        None if claimed_os.is_some() => log::warn!(
+          "Fingerprint OS is not one Chromium can spoof profile={} os={claimed_os:?}",
+          profile.id
+        ),
+        None => {}
       }
+    }
+    if port.is_none() {
+      for page in pages {
+        args.push(page.to_string());
+      }
+    } else if let Some(page) = url {
+      args.push(page.to_string());
     }
     let child = std::process::Command::new(&executable)
       .args(&args)
@@ -1399,16 +1434,32 @@ impl BrowserRunner {
             .map(|status| status.success())
             .unwrap_or(false)
         };
+        // `taskkill` is a Windows program. Calling it on macOS fails
+        // immediately, the browser window stays up, and the proxy worker
+        // below is still torn down — every later request goes to a dead
+        // SOCKS port, which looks like the profile has no internet.
         #[cfg(not(target_os = "windows"))]
-        let killed = std::process::Command::new("taskkill")
-          .args(["/PID", &pid.to_string(), "/T", "/F"])
-          .status()
-          .map(|status| status.success())
-          .unwrap_or(false);
+        let killed = {
+          use nix::sys::signal::{kill, Signal};
+          use nix::unistd::Pid;
+          let target = Pid::from_raw(pid as i32);
+          let _ = kill(target, Signal::SIGTERM);
+          tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+          if crate::proxy_storage::is_process_running(pid) {
+            let _ = kill(target, Signal::SIGKILL);
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+          }
+          !crate::proxy_storage::is_process_running(pid)
+        };
         log::info!(
           "Chromium stopped profile={} pid={pid} ok={killed}",
           profile.id
         );
+        if !killed {
+          return Err(
+            std::io::Error::other(format!("Chromium process {pid} is still running")).into(),
+          );
+        }
       }
       let profile_id_str = profile.id.to_string();
       if let Err(e) = PROXY_MANAGER

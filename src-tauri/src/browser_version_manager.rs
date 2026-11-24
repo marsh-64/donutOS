@@ -201,13 +201,6 @@ impl BrowserVersionManager {
     &self,
     browser: &str,
   ) -> Result<BrowserReleaseTypes, Box<dyn std::error::Error + Send + Sync>> {
-    #[cfg(feature = "free")]
-    if browser == "wayfern" {
-      return Err(
-        "Wayfern release metadata is disabled in free builds; use installed engines".into(),
-      );
-    }
-
     if browser == "chromium" {
       // The open engine ships from a pinned Chrome for Testing build: the
       // stable channel is exactly that version, offline-safe.
@@ -416,9 +409,24 @@ impl BrowserVersionManager {
   #[cfg(feature = "free")]
   pub const CHROMIUM_PINNED_VERSION: &str = "148.0.7778.215";
 
-  /// Digest of the pinned fingerprint-chromium Windows archive, verified the
-  /// same way the CfT digest is: against this constant, no sidecar needed.
-  #[cfg(feature = "free")]
+  /// Digest of the pinned fingerprint-chromium archive for this OS. CfT
+  /// publishes no sidecar, and the GitHub release does not either, so the
+  /// downloader verifies against this constant. Each OS has its own asset:
+  /// the Windows zip digest must not be applied to the macOS dmg.
+  #[cfg(all(feature = "free", target_os = "windows"))]
+  pub const CHROMIUM_PINNED_SHA256: &str =
+    "9ef3f471b7a6641b4224532522b29141ce3746e27d55788d88e2fd951f362579";
+
+  /// `ungoogled-chromium_148.0.7778.215-1.1_macos.dmg` from the same release.
+  /// arm64 Mach-O.
+  #[cfg(all(feature = "free", target_os = "macos"))]
+  pub const CHROMIUM_PINNED_SHA256: &str =
+    "b72f091e2e1a7583eed389c4b8e3534ed355e568af8c8bbf8fc30a25e23ca679";
+
+  /// Linux still has no pinned fingerprint-chromium asset here. The constant
+  /// stays defined so the free build compiles; it is the Windows digest and
+  /// will not match a Chrome-for-Testing download.
+  #[cfg(all(feature = "free", not(any(target_os = "windows", target_os = "macos"))))]
   pub const CHROMIUM_PINNED_SHA256: &str =
     "9ef3f471b7a6641b4224532522b29141ce3746e27d55788d88e2fd951f362579";
 
@@ -469,10 +477,25 @@ impl BrowserVersionManager {
             is_archive: true,
           })
         }
+        #[cfg(all(feature = "free", target_os = "macos"))]
+        {
+          const FPCHROMIUM_VERSION: &str = "148.0.7778.215";
+          const FPCHROMIUM_ASSET: &str = "ungoogled-chromium_148.0.7778.215-1.1_macos.dmg";
+          Ok(DownloadInfo {
+            url: format!(
+              "https://github.com/adryfish/fingerprint-chromium/releases/download/{FPCHROMIUM_VERSION}/{FPCHROMIUM_ASSET}"
+            ),
+            filename: FPCHROMIUM_ASSET.to_string(),
+            is_archive: true,
+          })
+        }
         // Chrome for Testing: the open engine on every other build. Pinned
         // public archives, no account, no entitlement — every CDP domain is
         // unmetered on it.
-        #[cfg(not(all(feature = "free", target_os = "windows")))]
+        #[cfg(not(any(
+          all(feature = "free", target_os = "windows"),
+          all(feature = "free", target_os = "macos")
+        )))]
         {
           let platform_path = match (os.as_str(), arch.as_str()) {
             ("windows", "x64") | ("windows", "arm64") => "win64/chrome-win64.zip",
@@ -554,12 +577,24 @@ mod tests {
       // public GitHub release archive.
       assert!(info
         .url
-        .starts_with("https://github.com/adryfish/fingerprint-chromium/releases/download/"));
+        .ends_with("ungoogled-chromium_148.0.7778.215-1.1_windows_x64.zip"));
       assert!(info
         .url
-        .contains(BrowserVersionManager::CHROMIUM_PINNED_VERSION));
+        .starts_with("https://github.com/adryfish/fingerprint-chromium/releases/download/"));
     }
-    #[cfg(not(all(feature = "free", target_os = "windows")))]
+    #[cfg(all(feature = "free", target_os = "macos"))]
+    {
+      assert!(info
+        .url
+        .ends_with("ungoogled-chromium_148.0.7778.215-1.1_macos.dmg"));
+      assert!(info
+        .url
+        .starts_with("https://github.com/adryfish/fingerprint-chromium/releases/download/"));
+    }
+    #[cfg(not(any(
+      all(feature = "free", target_os = "windows"),
+      all(feature = "free", target_os = "macos")
+    )))]
     {
       assert!(info
         .url
@@ -587,18 +622,6 @@ mod tests {
       releases.stable,
       Some(BrowserVersionManager::CHROMIUM_PINNED_VERSION.to_string())
     );
-  }
-
-  #[cfg(feature = "free")]
-  #[tokio::test]
-  async fn wayfern_release_types_are_not_fetched_in_free_build() {
-    let result = BrowserVersionManager::instance()
-      .get_browser_release_types("wayfern")
-      .await;
-    let error = result
-      .err()
-      .expect("free builds must not fetch Wayfern metadata");
-    assert!(error.to_string().contains("disabled in free builds"));
   }
 
   #[test]

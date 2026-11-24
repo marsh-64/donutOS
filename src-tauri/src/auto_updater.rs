@@ -796,7 +796,7 @@ mod tests {
     assert!(pending.is_none());
     #[cfg(not(feature = "free"))]
     assert_eq!(
-      pending.map(|update| update.id.as_str()),
+      pending.as_ref().map(|update| update.id.as_str()),
       Some("legacy-wayfern-update")
     );
   }

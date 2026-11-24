@@ -3,10 +3,10 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const minimumFreeGiB = 55;
-// Build artifacts are the disk hazard this guard exists for, so they live on
-// the data drive by default; an explicit CARGO_TARGET_DIR always wins. A
-// shared, warm target dir also keeps the pre-commit cargo steps fast enough
-// that commits stop bypassing hooks with --no-verify.
+// On the author's Windows machine, build artifacts go to a data drive so C:
+// does not fill up. An explicit CARGO_TARGET_DIR always wins. Other platforms
+// keep cargo's default target dir: `D:` contains `:`, which is the
+// DYLD_FALLBACK_LIBRARY_PATH separator, and rustc refuses to start.
 const defaultTargetDir = "D:/ZDownloads/donut-free-target";
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const cargoCwd = join(repoRoot, "src-tauri");
@@ -82,11 +82,12 @@ export function runCargoGuard({
     CARGO_BUILD_JOBS: "2",
     CARGO_INCREMENTAL: "0",
   };
-  // CI runners must stay machine-neutral: a host-specific default target dir
-  // leaks into their cargo invocations and breaks non-Windows runners (the
-  // path gets joined onto the manifest dir). On CI, use cargo's own default.
-  if (!env.CI) {
-    childEnv.CARGO_TARGET_DIR = env.CARGO_TARGET_DIR || defaultTargetDir;
+  // The data-drive default is a Windows path. CI and every other OS keep
+  // cargo's own target dir (or an explicit CARGO_TARGET_DIR already in env,
+  // which the spread above preserves). Joining `D:/...` onto the manifest
+  // dir breaks rustc on macOS: `:` is the DYLD_FALLBACK_LIBRARY_PATH separator.
+  if (!env.CI && platform === "win32" && !env.CARGO_TARGET_DIR) {
+    childEnv.CARGO_TARGET_DIR = defaultTargetDir;
   }
   const result = spawn("cargo", cargoArgs, {
     cwd: cargoCwd,

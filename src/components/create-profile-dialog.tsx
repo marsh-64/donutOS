@@ -90,7 +90,6 @@ import { useVpnEvents } from "@/hooks/use-vpn-events";
 import { translateBackendError } from "@/lib/backend-errors";
 import { getOSDisplayName, getOSIcon } from "@/lib/browser-utils";
 import { DNS_BLOCKLIST_LEVELS } from "@/lib/dns-blocklist-levels";
-import { detectFreeBuild } from "@/lib/free-build";
 import { MOTION_DURATION, MOTION_EASE_OUT, MOTION_SPRING } from "@/lib/motion";
 import { startPagesFromText } from "@/lib/start-pages";
 import { notifySystem } from "@/lib/system-notify";
@@ -307,8 +306,7 @@ export function CreateProfileDialog({
   >(null);
   const engine =
     engineOverride ?? (wayfernVersions.length > 0 ? "wayfern" : "chromium");
-  const showEngineSelector =
-    wayfernVersions.length > 0 && chromiumVersions.length > 0;
+  const engineLabel = engine === "wayfern" ? "Wayfern" : "Chromium";
   const downloadedVersions =
     engine === "wayfern" ? wayfernVersions : chromiumVersions;
 
@@ -317,23 +315,6 @@ export function CreateProfileDialog({
       const request = ++versionRequestRef.current;
       setIsLoadingReleaseTypes(true);
       setReleaseTypesError(false);
-      // Resolve the build flavor before a cold-start can request the Wayfern
-      // manifest while the synchronous free-build cache is still unknown.
-      const freeBuild = engine === "wayfern" ? await detectFreeBuild() : false;
-      if (request !== versionRequestRef.current) return;
-      if (engine === "wayfern" && freeBuild) {
-        try {
-          const downloaded = await loadDownloadedVersions("wayfern");
-          if (versionRequestRef.current === request) {
-            setReleaseTypes(downloaded.length ? { stable: downloaded[0] } : {});
-            setReleaseTypesError(downloaded.length === 0);
-          }
-        } finally {
-          if (versionRequestRef.current === request)
-            setIsLoadingReleaseTypes(false);
-        }
-        return;
-      }
       try {
         const releases = await invoke<BrowserReleaseTypes>(
           "get_browser_release_types",
@@ -679,7 +660,7 @@ export function CreateProfileDialog({
   const handleDownload = async () => {
     if (!latestVersion) return;
     try {
-      await downloadBrowser("chromium", latestVersion);
+      await downloadBrowser(engine, latestVersion);
     } catch (error) {
       console.error("Failed to download Wayfern:", error);
     }
@@ -920,34 +901,32 @@ export function CreateProfileDialog({
             </motion.p>
           )}
 
-          {showEngineSelector && (
-            <motion.div
-              data-slot="profile-engine-selector"
-              className="flex flex-wrap items-center gap-1.5 px-2"
-              {...rise(0.03)}
-            >
-              <span className="sr-only">{t("createProfile.engine.label")}</span>
-              {(["wayfern", "chromium"] as const).map((option) => (
-                <button
-                  key={option}
-                  type="button"
-                  aria-pressed={engine === option}
-                  onClick={() => setEngineOverride(option)}
-                  disabled={isCreating}
-                  className={cn(
-                    "inline-flex h-8 items-center gap-1.5 rounded-full border px-3 text-xs font-medium transition-colors motion-reduce:transition-none",
-                    engine === option
-                      ? "border-transparent bg-primary text-primary-foreground"
-                      : "border-border text-muted-foreground hover:text-foreground",
-                  )}
-                >
-                  {option === "wayfern"
-                    ? t("createProfile.engine.wayfern")
-                    : t("createProfile.engine.chromium")}
-                </button>
-              ))}
-            </motion.div>
-          )}
+          <motion.div
+            data-slot="profile-engine-selector"
+            className="flex flex-wrap items-center gap-1.5 px-2"
+            {...rise(0.03)}
+          >
+            <span className="sr-only">{t("createProfile.engine.label")}</span>
+            {(["wayfern", "chromium"] as const).map((option) => (
+              <button
+                key={option}
+                type="button"
+                aria-pressed={engine === option}
+                onClick={() => setEngineOverride(option)}
+                disabled={isCreating}
+                className={cn(
+                  "inline-flex h-8 items-center gap-1.5 rounded-full border px-3 text-xs font-medium transition-colors motion-reduce:transition-none",
+                  engine === option
+                    ? "border-transparent bg-primary text-primary-foreground"
+                    : "border-border text-muted-foreground hover:text-foreground",
+                )}
+              >
+                {option === "wayfern"
+                  ? t("createProfile.engine.wayfern")
+                  : t("createProfile.engine.chromium")}
+              </button>
+            ))}
+          </motion.div>
 
           <motion.div className="flex items-center gap-1.5" {...rise(0.04)}>
             <span id={proxyLabelId} className="sr-only">
@@ -1321,7 +1300,7 @@ export function CreateProfileDialog({
                 aria-hidden="true"
               />
               {t("createProfile.version.downloading", {
-                browser: engine === "wayfern" ? "Wayfern" : "Chromium",
+                browser: engineLabel,
                 version: latestVersion,
               })}
             </motion.p>
@@ -1360,7 +1339,7 @@ export function CreateProfileDialog({
               >
                 <p className="flex-1">
                   {t("createProfile.version.needsDownload", {
-                    browser: "Chromium",
+                    browser: engineLabel,
                     version: latestVersion,
                   })}
                 </p>
@@ -1378,7 +1357,7 @@ export function CreateProfileDialog({
                 className={cn(STATUS_CLASS, "text-warning-text")}
               >
                 {t("createProfile.platformUnavailable", {
-                  browser: "Chromium",
+                  browser: engineLabel,
                 })}
               </p>
             ))
@@ -1568,7 +1547,7 @@ export function CreateProfileDialog({
                     {creatableVersion && (
                       <p className="text-xs text-muted-foreground">
                         {t("createProfile.version.available", {
-                          browser: "Chromium",
+                          browser: engineLabel,
                           version: creatableVersion,
                         })}
                       </p>
@@ -1580,7 +1559,7 @@ export function CreateProfileDialog({
                         <div className={cn(STATUS_CLASS, "py-1.5 pr-1.5")}>
                           <p className="flex-1">
                             {t("createProfile.version.upgradeAvailable", {
-                              browser: "Chromium",
+                              browser: engineLabel,
                               version: latestVersion,
                             })}
                           </p>

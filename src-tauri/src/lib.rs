@@ -263,6 +263,7 @@ mod cookie_bot_exit;
 mod cookie_bot_local;
 mod cookie_manager;
 mod cookie_paste;
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod engine_patch;
 pub mod events;
 mod local_activity;

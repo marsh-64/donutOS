@@ -4898,7 +4898,7 @@ impl McpServer {
             },
             "browser": {
               "type": "string",
-              "enum": ["wayfern"],
+              "enum": ["wayfern", "chromium"],
               "description": "Browser engine to use"
             },
             "proxy_id": {
@@ -7896,10 +7896,13 @@ impl McpServer {
       })?;
 
     // Check if it's a Wayfern profile
-    if profile.browser != "wayfern" {
+    if !crate::cdp_target::browser_can_be_driven(&profile.browser) {
       return Err(McpError {
         code: -32000,
-        message: "MCP only supports Wayfern profiles".to_string(),
+        message: format!(
+          "MCP page control supports Wayfern and Chromium, not {}",
+          profile.browser
+        ),
         data: None,
       });
     }
@@ -7958,10 +7961,13 @@ impl McpServer {
       })?;
 
     // Check if it's a Wayfern profile
-    if profile.browser != "wayfern" {
+    if !crate::cdp_target::browser_can_be_driven(&profile.browser) {
       return Err(McpError {
         code: -32000,
-        message: "MCP only supports Wayfern profiles".to_string(),
+        message: format!(
+          "MCP page control supports Wayfern and Chromium, not {}",
+          profile.browser
+        ),
         data: None,
       });
     }
@@ -8094,10 +8100,13 @@ impl McpServer {
       })?;
 
     // Check if it's a Wayfern profile
-    if profile.browser != "wayfern" {
+    if !crate::cdp_target::browser_can_be_driven(&profile.browser) {
       return Err(McpError {
         code: -32000,
-        message: "MCP only supports Wayfern profiles".to_string(),
+        message: format!(
+          "MCP page control supports Wayfern and Chromium, not {}",
+          profile.browser
+        ),
         data: None,
       });
     }
@@ -8374,10 +8383,10 @@ impl McpServer {
         data: None,
       })?;
 
-    if browser != "wayfern" {
+    if !crate::cdp_target::browser_can_be_driven(browser) {
       return Err(McpError {
         code: -32602,
-        message: "browser must be 'wayfern'".to_string(),
+        message: "browser must be 'wayfern' or 'chromium'".to_string(),
         data: None,
       });
     }
@@ -8880,10 +8889,13 @@ impl McpServer {
       })?;
 
     // Check if it's a Wayfern profile
-    if profile.browser != "wayfern" {
+    if !crate::cdp_target::browser_can_be_driven(&profile.browser) {
       return Err(McpError {
         code: -32000,
-        message: "MCP only supports Wayfern profiles".to_string(),
+        message: format!(
+          "MCP page control supports Wayfern and Chromium, not {}",
+          profile.browser
+        ),
         data: None,
       });
     }
@@ -11050,10 +11062,13 @@ impl McpServer {
         data: None,
       })?;
 
-    if profile.browser != "wayfern" {
+    if !crate::cdp_target::browser_can_be_driven(&profile.browser) {
       return Err(McpError {
         code: -32000,
-        message: "MCP only supports Wayfern profiles".to_string(),
+        message: format!(
+          "MCP page control supports Wayfern and Chromium, not {}",
+          profile.browser
+        ),
         data: None,
       });
     }

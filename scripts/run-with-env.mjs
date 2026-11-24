@@ -7,7 +7,7 @@
 // Plain shell `source .env` works on macOS/Linux but not Windows; this
 // wrapper is platform-agnostic.
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -42,6 +42,22 @@ const [, , cmd, ...args] = process.argv;
 if (!cmd) {
   console.error("usage: run-with-env.mjs <command> [args...]");
   process.exit(2);
+}
+
+// Tauri polls devUrl for about 180s once its CLI starts. Compiling the proxy
+// sidecar inside `beforeDevCommand` (before `pnpm dev`) spends that window on
+// Cargo, so nothing is listening on :12341 yet. Build the sidecar here first.
+if (cmd === "tauri" && args[0] === "dev") {
+  const pre = spawnSync("pnpm", ["copy-proxy-binary"], {
+    cwd: projectRoot,
+    stdio: "inherit",
+    shell: process.platform === "win32",
+  });
+  if (pre.error) {
+    console.error("Failed to build proxy sidecar:", pre.error.message);
+    process.exit(1);
+  }
+  if ((pre.status ?? 1) !== 0) process.exit(pre.status ?? 1);
 }
 
 // On Windows, npm-installed bins (e.g. `tauri`) are `.cmd` shims that cannot be

@@ -175,6 +175,12 @@ impl Patience {
   }
 }
 
+/// Wayfern and the open Chromium engine both expose a local DevTools port.
+/// Anything else has no page-control channel.
+pub fn browser_can_be_driven(browser: &str) -> bool {
+  matches!(browser, "wayfern" | "chromium")
+}
+
 /// Find the browser for `profile`, wherever it is running.
 ///
 /// Local wins when both look possible: the profile lock makes a genuine overlap
@@ -188,7 +194,7 @@ impl Patience {
 /// split covers a stale `process_id` left by a crash — nothing answers on the
 /// recorded port, so the remote session is found instead of a dead one.
 pub async fn resolve(profile: &BrowserProfile) -> Result<CdpTarget, ResolveError> {
-  if profile.browser != "wayfern" {
+  if !browser_can_be_driven(&profile.browser) {
     return Err(ResolveError::Unsupported(format!(
       "Profile '{}' runs {}, which cannot be driven over CDP",
       profile.name, profile.browser

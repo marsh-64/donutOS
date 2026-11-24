@@ -92,6 +92,24 @@ test("CI environments keep the cargo target dir machine-neutral", () => {
   );
 });
 
+test("non-Windows hosts do not inherit the Windows target dir", () => {
+  const calls = [];
+  const status = runCargoGuard({
+    args: ["build", "--features", "free"],
+    platform: "darwin",
+    env: { PATH: "test-path" },
+    spawn(command, args, options) {
+      calls.push({ command, args, options });
+      return { status: 0 };
+    },
+  });
+
+  assert.equal(status, 0);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].command, "cargo");
+  assert.equal(calls[0].options.env.CARGO_TARGET_DIR, undefined);
+});
+
 test("an explicit CARGO_TARGET_DIR wins over the data-drive default", () => {
   const calls = [];
   const status = runCargoGuard({

@@ -8,8 +8,20 @@ function describe(reason: unknown): string {
   return typeof reason === "string" ? reason : JSON.stringify(reason);
 }
 
+function runningInsideTauri(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+function report(message: string) {
+  // A rejected log must not become another unhandled rejection: this listener
+  // is what reports those, and calling it again fills the dev server forever.
+  void logError(message).catch(() => {
+    console.error(message);
+  });
+}
+
 export async function setupLogging() {
-  if (consoleAttached) {
+  if (consoleAttached || !runningInsideTauri()) {
     return;
   }
 
@@ -18,12 +30,12 @@ export async function setupLogging() {
   if (!errorsForwarded) {
     errorsForwarded = true;
     window.addEventListener("error", (event) => {
-      void logError(
+      report(
         `Uncaught error err="${describe(event.error ?? event.message)}" source=${event.filename}:${event.lineno}:${event.colno}`,
       );
     });
     window.addEventListener("unhandledrejection", (event) => {
-      void logError(`Unhandled rejection err="${describe(event.reason)}"`);
+      report(`Unhandled rejection err="${describe(event.reason)}"`);
     });
   }
 

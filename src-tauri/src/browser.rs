@@ -448,15 +448,27 @@ impl Browser for ChromiumBrowser {
     }
     #[cfg(target_os = "macos")]
     {
-      let candidate = install_dir
-        .join("Google Chrome for Testing.app")
-        .join("Contents")
-        .join("MacOS")
-        .join("Google Chrome for Testing");
-      if candidate.is_file() {
-        return Ok(candidate);
+      // Chrome for Testing keeps its own bundle name. fingerprint-chromium's
+      // macOS dmg extracts to Chromium.app, with the executable matching the
+      // bundle stem.
+      let named = [
+        install_dir
+          .join("Google Chrome for Testing.app")
+          .join("Contents")
+          .join("MacOS")
+          .join("Google Chrome for Testing"),
+        install_dir
+          .join("Chromium.app")
+          .join("Contents")
+          .join("MacOS")
+          .join("Chromium"),
+      ];
+      for candidate in named {
+        if candidate.is_file() {
+          return Ok(candidate);
+        }
       }
-      Err("Chrome for Testing app not found in the install directory".into())
+      Err("Chromium app not found in the install directory".into())
     }
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     {
@@ -488,6 +500,9 @@ impl Browser for ChromiumBrowser {
     if let Some(port) = remote_debugging_port {
       args.push("--remote-debugging-address=127.0.0.1".to_string());
       args.push(format!("--remote-debugging-port={port}"));
+      // A local agent attaches from another process. Without this, Chromium
+      // accepts the port and then refuses the websocket.
+      args.push("--remote-allow-origins=*".to_string());
     }
 
     if headless {
@@ -647,6 +662,7 @@ mod tests {
     assert!(args.contains(&"--user-data-dir=C:\\profiles\\p1".to_string()));
     assert!(args.contains(&"--remote-debugging-port=4499".to_string()));
     assert!(args.contains(&"--remote-debugging-address=127.0.0.1".to_string()));
+    assert!(args.contains(&"--remote-allow-origins=*".to_string()));
     assert!(args.contains(&"--headless=new".to_string()));
   }
 
@@ -662,6 +678,25 @@ mod tests {
     std::fs::create_dir_all(&dir).expect("temp dir");
     assert!(!ChromiumBrowser.is_version_downloaded("158.0.8123.0", &dir));
     let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  #[cfg(target_os = "macos")]
+  #[test]
+  fn chromium_app_bundle_is_the_open_engine() {
+    use tempfile::TempDir;
+    let temp = TempDir::new().unwrap();
+    let install_dir = temp.path();
+    let macos_dir = install_dir
+      .join("Chromium.app")
+      .join("Contents")
+      .join("MacOS");
+    std::fs::create_dir_all(&macos_dir).unwrap();
+    std::fs::File::create(macos_dir.join("Chromium")).unwrap();
+
+    let exe = ChromiumBrowser
+      .get_executable_path(install_dir)
+      .expect("fingerprint-chromium app should be found");
+    assert_eq!(exe.file_name().unwrap().to_str().unwrap(), "Chromium");
   }
 
   #[cfg(target_os = "windows")]

@@ -8,3 +8,5 @@
 
 /binaries/**
 !**/.gitkeep
+# Accidental Windows-style CARGO_TARGET_DIR path
+/D:/

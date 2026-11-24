@@ -203,13 +203,16 @@ fn matches(profile: &BrowserProfile, names: &Names, query: &ProfileQuery) -> boo
   true
 }
 
-/// The `list_profiles` answer. Only Wayfern profiles can be driven over MCP;
-/// the others are counted, so an agent knows they exist.
+/// The `list_profiles` answer. Wayfern and Chromium can be driven over MCP;
+/// any other engine is counted, so an agent knows it exists.
 pub fn list_profiles(profiles: &[BrowserProfile], names: &Names, query: &ProfileQuery) -> Value {
-  let hidden = profiles.iter().filter(|p| p.browser != "wayfern").count();
+  let hidden = profiles
+    .iter()
+    .filter(|p| !crate::cdp_target::browser_can_be_driven(&p.browser))
+    .count();
   let mut found: Vec<&BrowserProfile> = profiles
     .iter()
-    .filter(|p| p.browser == "wayfern" && matches(p, names, query))
+    .filter(|p| crate::cdp_target::browser_can_be_driven(&p.browser) && matches(p, names, query))
     .collect();
   found.sort_by(|a, b| {
     a.name
@@ -233,7 +236,7 @@ pub fn list_profiles(profiles: &[BrowserProfile], names: &Names, query: &Profile
   if hidden > 0 {
     answer["hidden"] = json!({
       "count": hidden,
-      "reason": "Not Wayfern profiles: they can not be driven over MCP.",
+      "reason": "Profiles on an engine MCP cannot drive.",
     });
   }
   answer
